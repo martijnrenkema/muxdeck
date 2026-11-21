@@ -48,6 +48,9 @@ type Chip struct {
 	Value string `json:"value"`
 	Icon  string `json:"icon,omitempty"`
 	Color string `json:"color,omitempty"`
+	// ResetsAt is when the window behind the value resets (Unix seconds), so
+	// the sidebar can stop showing a used-up limit once it has reset.
+	ResetsAt int64 `json:"resets_at,omitempty"`
 }
 
 func ValidState(s string) bool {
@@ -108,6 +111,9 @@ func (s *Status) Normalize() {
 		}
 		if !chipColors[c.Color] {
 			c.Color = ""
+		}
+		if c.ResetsAt < 0 {
+			c.ResetsAt = 0
 		}
 		if c.Value == "" {
 			continue

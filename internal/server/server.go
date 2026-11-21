@@ -18,8 +18,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -29,7 +31,9 @@ import (
 	"github.com/josecarlosrivas/muxdeck/internal/cloud"
 	"github.com/josecarlosrivas/muxdeck/internal/mushrun"
 	"github.com/josecarlosrivas/muxdeck/internal/power"
+	"github.com/josecarlosrivas/muxdeck/internal/push"
 	"github.com/josecarlosrivas/muxdeck/internal/remote"
+	"github.com/josecarlosrivas/muxdeck/internal/subagent"
 	"github.com/josecarlosrivas/muxdeck/internal/tcc"
 	"github.com/josecarlosrivas/muxdeck/internal/tmux"
 	"github.com/josecarlosrivas/muxdeck/relay"
@@ -47,6 +51,17 @@ type Server struct {
 	token    string
 	foldCase bool // generated codes are matched case-insensitively, GitHub-device-auth style
 	agents   *agent.Store
+	subs     *subagent.Tracker
+	regMu    sync.Mutex
+	regOwned map[string]bool   // sessions whose status came from Claude's registry
+	regPanes map[string]string // session → pane its Claude runs in, per the registry
+	regLive  map[string]subagent.Live
+	restore  restoreStore
+	blocks   blockStore
+	convMu   sync.Mutex
+	convs    map[string]convInfo // session → conversation its agent hooks reported
+	quiet    quietWatch
+	prompts  promptQueue
 	repos    *repoCache
 	ports    *portCache
 	remotes  *remote.Manager
@@ -54,10 +69,20 @@ type Server struct {
 	powerm   *power.Manager
 	relaym   *relay.Manager
 	cloudm   *cloud.Manager
+	push     *push.Manager
+	perms    permStore
+	changes  changes
+	watch    watchers
+	settings settingsStore
+	version  string
+	release  releaseCheck
 }
 
+// SetPush enables Web Push; without it alerts only reach open clients.
+func (s *Server) SetPush(m *push.Manager) { s.push = m }
+
 func New(static fs.FS, token string, foldCase bool, remotes *remote.Manager, mushruns *mushrun.Manager, relaym *relay.Manager, cloudm *cloud.Manager, powerm *power.Manager) *Server {
-	s := &Server{mux: http.NewServeMux(), token: token, foldCase: foldCase, agents: agent.NewStore(), repos: newRepoCache(), ports: newPortCache(), remotes: remotes, mushruns: mushruns, relaym: relaym, cloudm: cloudm, powerm: powerm}
+	s := &Server{mux: http.NewServeMux(), token: token, foldCase: foldCase, agents: agent.NewStore(), subs: newSubagentTracker(), repos: newRepoCache(), ports: newPortCache(), remotes: remotes, mushruns: mushruns, relaym: relaym, cloudm: cloudm, powerm: powerm}
 	s.mux.Handle("/", http.FileServerFS(static))
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
 	s.mux.HandleFunc("GET /api/sessions", s.auth(s.handleList))
@@ -68,10 +93,33 @@ func New(static fs.FS, token string, foldCase bool, remotes *remote.Manager, mus
 	s.mux.HandleFunc("POST /api/sessions/{name}/mouse", s.auth(s.handleMouseSet))
 	s.mux.HandleFunc("GET /api/sessions/{name}/attach", s.auth(s.handleAttach))
 	s.mux.HandleFunc("POST /api/sessions/{name}/send", s.auth(s.handleSend))
+	s.mux.HandleFunc("POST /api/sessions/{name}/upload", s.auth(s.handleUpload))
 	s.mux.HandleFunc("GET /api/sessions/{name}/diff", s.auth(s.handleDiff))
 	s.mux.HandleFunc("GET /api/sessions/{name}/files", s.auth(s.handleFiles))
 	s.mux.HandleFunc("GET /api/sessions/{name}/file", s.auth(s.handleFile))
+	s.mux.HandleFunc("GET /api/sessions/{name}/subagents/{id}", s.auth(s.handleSubagent))
+	s.mux.HandleFunc("POST /api/sessions/{name}/subagents/{id}/message", s.auth(s.handleSubagentMessage))
+	s.mux.HandleFunc("POST /api/sessions/{name}/prompt", s.auth(s.handlePrompt))
+	s.mux.HandleFunc("POST /api/sessions/{name}/quiet", s.auth(s.handleQuiet))
+	s.mux.HandleFunc("GET /api/projects", s.auth(s.handleProjects))
+	s.mux.HandleFunc("POST /api/agent/blocked", s.auth(s.handleBlockedReport))
+	s.mux.HandleFunc("POST /api/agent/blocked/{id}", s.auth(s.handleBlockedAnswer))
+	s.mux.HandleFunc("GET /api/sessions/{name}/tasks/{id}", s.auth(s.handleTaskOutput))
+	s.mux.HandleFunc("GET /api/restore", s.auth(s.handleRestoreList))
+	s.mux.HandleFunc("POST /api/restore", s.auth(s.handleRestore))
+	s.mux.HandleFunc("DELETE /api/restore", s.auth(s.handleRestoreDismiss))
 	s.mux.HandleFunc("POST /api/agent/status", s.auth(s.handleAgentStatus))
+	s.mux.HandleFunc("POST /api/agent/permission", s.auth(s.handlePermissionAsk))
+	s.mux.HandleFunc("POST /api/agent/permission/{id}", s.auth(s.handlePermissionAnswer))
+	s.mux.HandleFunc("GET /api/changes", s.auth(s.handleChanges))
+	s.mux.HandleFunc("GET /api/push", s.auth(s.handlePushKey))
+	s.mux.HandleFunc("POST /api/push", s.auth(s.handlePushSubscribe))
+	s.mux.HandleFunc("DELETE /api/push", s.auth(s.handlePushSubscribe))
+	s.mux.HandleFunc("POST /api/push/test", s.auth(s.handlePushTest))
+	s.mux.HandleFunc("GET /api/settings", s.auth(s.handleSettingsGet))
+	s.mux.HandleFunc("PUT /api/settings", s.auth(s.handleSettingsPut))
+	s.mux.HandleFunc("GET /api/version", s.auth(s.handleVersion))
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/doctor", s.auth(s.handleDoctor))
 	s.mux.HandleFunc("GET /api/meta", s.auth(s.handleMeta))
 	s.mux.HandleFunc("POST /api/debug/client-log", s.auth(s.handleClientLog))
@@ -95,6 +143,7 @@ func New(static fs.FS, token string, foldCase bool, remotes *remote.Manager, mus
 	s.mux.HandleFunc("POST /api/cloud/sync", s.auth(s.handleCloudSync))
 	s.mux.HandleFunc("GET /api/power", s.auth(s.handlePowerStatus))
 	s.mux.HandleFunc("POST /api/power", s.auth(s.handlePowerSet))
+	go s.watchSubagents()
 	return s
 }
 
@@ -283,8 +332,36 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if foreignWrite(r) {
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
 		next(w, r)
 	}
+}
+
+// foreignWrite is a state-changing request a page on another origin made
+// with this browser's cookie. Every node of a tailnet is the same site
+// (<tailnet>.ts.net), so SameSite=Strict alone lets any page served from
+// one of them answer a permission request or add a push subscription here.
+// Scripts using the bearer token send neither header.
+func foreignWrite(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return false
+	case "same-site", "cross-site":
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	return err != nil || u.Host != r.Host
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -304,11 +381,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Store the canonical token so cookie auth is unaffected by typed case.
+	// Persistent: a session cookie dies whenever a phone kills the PWA, which
+	// asked for the token on nearly every open.
 	http.SetCookie(w, &http.Cookie{
 		Name:     tokenCookie,
 		Value:    s.token,
 		Path:     "/",
+		MaxAge:   400 * 24 * 60 * 60,
 		HttpOnly: true,
+		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 		SameSite: http.SameSiteStrictMode,
 	})
 	w.WriteHeader(http.StatusNoContent)
@@ -326,6 +407,9 @@ func writeErr(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	if errors.Is(err, tmux.ErrBadName) {
 		status = http.StatusBadRequest
+	} else {
+		// The request log shows only "500"; this is the why.
+		log.Printf("error: %v", err)
 	}
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
@@ -351,6 +435,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.agents.Prune(names)
+	s.subs.Prune(names)
 	s.repos.prune(cwds)
 	listening := s.ports.state()
 
@@ -361,6 +446,14 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		// band; absent until the first refresh lands.
 		Ports []int         `json:"ports,omitempty"`
 		Agent *agent.Status `json:"agent,omitempty"`
+		// Open permission requests from the session's agent, oldest first.
+		Permissions []*permRequest `json:"permissions,omitempty"`
+		// Helpers the session's agent spawned: running, or recently done.
+		Subagents []subagent.Info `json:"subagents,omitempty"`
+		// Background commands and watches the agent started.
+		Tasks []subagent.Task `json:"tasks,omitempty"`
+		// Actions auto mode blocked, not yet answered.
+		Blocked []*blockedAction `json:"blocked,omitempty"`
 	}
 	out := make([]listEntry, len(sessions))
 	for i, sess := range sessions {
@@ -368,6 +461,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		if st, ok := s.agents.Get(sess.Name); ok {
 			out[i].Agent = &st
 		}
+		out[i].Permissions = s.perms.forSession(sess.Name)
+		out[i].Subagents = s.subs.List(sess.Name)
+		out[i].Tasks = s.subs.Tasks(sess.Name)
+		out[i].Blocked = s.blocks.forSession(sess.Name)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -381,6 +478,19 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Session string `json:"session"`
+		// The agent's own transcript, where its subagents are found. Kept
+		// out of agent.Status: clients get the subagents, not the path.
+		Transcript string `json:"transcript"`
+		// The agent's conversation id and directory (from its hooks), so a
+		// session lost to a reboot can resume it.
+		SessionID string `json:"session_id"`
+		Cwd       string `json:"cwd"`
+		// Reply is the start of the agent's last answer, for the "done"
+		// notification. Not kept.
+		Reply string `json:"reply"`
+		// Event is the hook event behind the report; a prompt the user
+		// sends settles the session's blocked actions.
+		Event string `json:"event"`
 		agent.Status
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Session == "" || body.Agent == "" {
@@ -401,7 +511,8 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 	// so a field the caller left out keeps what the last one said rather than
 	// blanking it. Saying so explicitly is what an empty value is for: a zero
 	// progress object, or an empty chip list.
-	if prev, ok := s.agents.Get(body.Session); ok && prev.Agent == body.Agent {
+	prev, had := s.agents.Get(body.Session)
+	if had && prev.Agent == body.Agent {
 		if body.Model == "" {
 			body.Model = prev.Model
 		}
@@ -415,7 +526,17 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
 			body.Chips = prev.Chips
 		}
 	}
+	s.reportedByAgent(body.Session)
 	s.agents.Set(body.Session, body.Status)
+	s.subs.Track(body.Session, body.Agent, body.Transcript, body.State)
+	s.noteConversation(body.Session, body.Agent, body.SessionID, body.Cwd, body.State)
+	if (body.Event == "UserPromptSubmit" || body.State == agent.StateIdle) && s.blocks.clear(body.Session) {
+		s.changes.bump()
+	}
+	s.notifyAgentWaiting(body.Session, prev, had, body.Status, body.Reply)
+	if !had || prev.State != body.State {
+		s.changes.bump()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -452,23 +573,48 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
+		// From the project launcher: a project directory and what to run
+		// in it. Without them the settings' start dir and command apply.
+		Dir   string `json:"dir"`
+		Agent string `json:"agent"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := tmux.New(body.Name); err != nil {
+	ns := s.settings.get().NewSession
+	dir, command := expandHome(ns.Dir), ns.Command
+	if body.Dir != "" || body.Agent != "" {
+		var err error
+		if dir, command, err = launchPlan(body.Name, body.Dir, body.Agent); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if err := tmux.NewIn(body.Name, dir); err != nil {
 		writeErr(w, err)
 		return
+	}
+	if body.Dir != "" {
+		s.noteLaunch(dir)
+	}
+	if command != "" {
+		if err := tmux.SendKeys(body.Name, command, true); err != nil {
+			log.Printf("new session %s: start command: %v", body.Name, err)
+		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"name": body.Name})
 }
 
 func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
-	if err := tmux.Kill(r.PathValue("name")); err != nil {
+	name := r.PathValue("name")
+	key, _ := tmux.Key(name)
+	if err := tmux.Kill(name); err != nil {
 		writeErr(w, err)
 		return
 	}
+	removeUploads(name, key)
+	s.forgetSession(name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -744,7 +890,10 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	// locale-less client.
 	cmd := exec.Command(tmux.Bin, "-u", "attach-session", "-t", "="+name)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ptmx, err := pty.Start(cmd)
+	// Start the tmux client at the browser's size when it says so: without
+	// it tmux sees the pty's default and resizes the window to 80x24 first,
+	// then to the real size a moment later, and the app inside draws twice.
+	ptmx, err := pty.StartWithSize(cmd, initialSize(r))
 	if err != nil {
 		log.Printf("attach %s: pty: %v", name, err)
 		send(websocket.TextMessage, []byte(`{"type":"error","data":"failed to start tmux client"}`))
@@ -759,6 +908,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	// keep-awake claim ends with the socket, whatever else is still up.
 	viewer := fmt.Sprintf("attach:%s:%p", name, conn)
 	defer s.powerm.Release(viewer)
+	defer s.watch.set(name, viewer, false)
 
 	// pty -> ws. Closing conn on exit unblocks the read loop below when the
 	// tmux client ends (session killed, server exit).
@@ -798,12 +948,21 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			if msg.Cols > 0 && msg.Rows > 0 {
 				pty.Setsize(ptmx, &pty.Winsize{Cols: msg.Cols, Rows: msg.Rows})
 			}
+		case "claim":
+			// The tmux client re-reports its size on SIGWINCH even when it
+			// has not changed, which makes it the session's latest client:
+			// the window takes this viewer's size again after another
+			// device had it.
+			if ws, err := pty.GetsizeFull(ptmx); err == nil && !tmux.Fits(name, int(ws.Cols), int(ws.Rows)) {
+				cmd.Process.Signal(syscall.SIGWINCH)
+			}
 		case "presence":
 			if msg.Data == "active" {
 				s.powerm.Acquire(viewer)
 			} else {
 				s.powerm.Release(viewer)
 			}
+			s.watch.set(name, viewer, msg.Data == "active")
 		}
 	}
 }
@@ -867,4 +1026,15 @@ func (s *Server) handleRelaySet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.relaym.Status())
+}
+
+// initialSize reads ?cols=&rows= from an attach request; nil leaves the pty
+// at its default.
+func initialSize(r *http.Request) *pty.Winsize {
+	cols, err1 := strconv.Atoi(r.URL.Query().Get("cols"))
+	rows, err2 := strconv.Atoi(r.URL.Query().Get("rows"))
+	if err1 != nil || err2 != nil || cols < 2 || rows < 2 || cols > 1000 || rows > 1000 {
+		return nil
+	}
+	return &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}
 }

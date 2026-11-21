@@ -3,6 +3,7 @@ package tmux
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // The length-prefixed payload exists so that separators and multi-byte
@@ -87,5 +88,35 @@ func TestSendKeysRejectsBadNames(t *testing.T) {
 		if err := SendKeys(name, "x", true); err != ErrBadName {
 			t.Errorf("%q: got %v, want ErrBadName", name, err)
 		}
+	}
+}
+
+// Only tmux's own "it isn't there" may count as absent; a blip with any
+// other message must leave Exists undecided, or the upload sweeper deletes
+// files of a live session.
+func TestGone(t *testing.T) {
+	for msg, want := range map[string]bool{
+		"can't find session: x":                       true,
+		"no server running on /tmp/tmux-1000/default": true,
+		"error connecting to /tmp/tmux-1000/default":  true,
+		"lost server":                false,
+		"server exited unexpectedly": false,
+		"":                           false,
+	} {
+		if got := gone([]byte(msg)); got != want {
+			t.Errorf("gone(%q) = %v, want %v", msg, got, want)
+		}
+	}
+}
+
+func TestSessionKeySurvivesRename(t *testing.T) {
+	a := Session{Name: "old", Created: time.Unix(1700000000, 0), id: "$7"}
+	b := a
+	b.Name = "new"
+	if a.Key() != "1700000000-7" || a.Key() != b.Key() {
+		t.Fatalf("keys %q / %q", a.Key(), b.Key())
+	}
+	if (Session{Name: "plain"}).Key() != "plain" {
+		t.Fatal("a session without id keys by name")
 	}
 }

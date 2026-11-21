@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"context"
@@ -20,6 +21,7 @@ import (
 	"github.com/josecarlosrivas/muxdeck/internal/cloud"
 	"github.com/josecarlosrivas/muxdeck/internal/mushrun"
 	"github.com/josecarlosrivas/muxdeck/internal/power"
+	"github.com/josecarlosrivas/muxdeck/internal/push"
 	"github.com/josecarlosrivas/muxdeck/internal/remote"
 	"github.com/josecarlosrivas/muxdeck/internal/server"
 	"github.com/josecarlosrivas/muxdeck/relay"
@@ -156,7 +158,17 @@ func serve() {
 		token, generated = genCode(8), true
 	}
 	srv := server.New(static, token, generated, remotes, mushruns, relaym, cloudm, powerm)
+	if pm, err := push.Open(envOr("MUXDECK_PUSH_CONFIG", defaultPushPath()), envOr("MUXDECK_PUSH_SUBJECT", "mailto:muxdeck@localhost")); err != nil {
+		log.Printf("push: disabled: %v", err)
+	} else {
+		srv.SetPush(pm)
+	}
+	srv.SetSettingsPath(filepath.Join(filepath.Dir(defaultPushPath()), "settings.json"))
+	srv.SetRestorePath(filepath.Join(filepath.Dir(defaultPushPath()), "restore.json"))
+	srv.StartQuietWatch()
+	srv.SetVersion(version)
 	powerm.Start(nil)
+	server.StartUploadSweeper()
 	relaym.Start(srv, token != "", log.Printf)
 	cloudm.Start(context.Background(), log.Printf)
 	if st := cloudm.Status(); st.SignedIn {
@@ -261,4 +273,14 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// defaultPushPath keeps the VAPID key and subscriptions next to the rest of
+// muxdeck's config.
+func defaultPushPath() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "muxdeck", "push.json")
 }
