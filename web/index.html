@@ -22,6 +22,8 @@
       <span class="hdr-tools">
         <button id="new-session" title="New session"></button>
         <button id="notify" title="Notify when an agent needs input" hidden></button>
+        <a id="dashboard-link" target="dashboard" rel="noopener" hidden></a>
+        <button id="settings-btn" title="Settings"></button>
         <button id="split" title="split view (side by side)"></button>
         <button id="refresh" title="Refresh sessions"></button>
         <button id="sidebar-toggle" title="Collapse sidebar"></button>
@@ -40,13 +42,19 @@
       <button data-key="&#x1b;[B">&#8595;</button>
       <button data-key="&#x1b;[D">&#8592;</button>
       <button data-key="&#x1b;[C">&#8594;</button>
+      <button data-key="&#x1b;[5~">pgup</button>
+      <button data-key="&#x1b;[6~">pgdn</button>
       <button id="key-paste">paste</button>
+      <button id="key-file">file</button>
       <button data-key="-">-</button>
       <button data-key="|">|</button>
       <button data-key="~">~</button>
       <button data-key="/">/</button>
     </div>
     <div id="panes"></div>
+    <button id="copy-offer" hidden></button>
+    <div id="upload-note" hidden></div>
+    <input id="file-pick" type="file" multiple hidden>
   </main>
 </div>
 <div id="palette" hidden>
@@ -63,10 +71,25 @@
     <footer class="pal-hint"></footer>
   </div>
 </div>
+<div id="launcher" hidden>
+  <div class="set-box launch-box" role="dialog" aria-label="New session">
+    <div class="set-head"><h2>New session</h2><button class="set-close" title="Close"></button></div>
+    <div class="launch-agents"></div>
+    <input class="launch-filter" placeholder="filter projects, or name an empty session" spellcheck="false" autocomplete="off" autocapitalize="off">
+    <ul class="launch-list"></ul>
+    <div class="launch-foot"><button class="launch-plain"></button></div>
+  </div>
+</div>
+<div id="settings" hidden>
+  <div class="set-box" role="dialog" aria-label="Settings">
+    <div class="set-head"><h2>Settings</h2><button class="set-close" title="Close"></button></div>
+    <div class="set-body"></div>
+  </div>
+</div>
 <div id="login" hidden>
   <form id="login-form">
     <h2>muxdeck</h2>
-    <input id="token" type="password" placeholder="access token" required autocomplete="current-password">
+    <input id="token" type="password" placeholder="access token" required autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go">
     <button>unlock</button>
     <p id="login-error" hidden>wrong token</p>
   </form>
