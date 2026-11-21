@@ -35,6 +35,51 @@ sessions from the browser.
   auto-generates an access code unless you configure a token or opt out;
   optional built-in TLS
 
+## This fork
+
+This tree carries changes on top of upstream muxdeck, aimed at running AI
+coding agents in tmux and following them from a phone:
+
+- **Agent tiles** in the sidebar: state in words (working / needs you /
+  done / idle), account-wide limits as bars, context and diff per session
+- **Permission cards**: Claude Code and Codex permission requests,
+  AskUserQuestion and auto-mode blocks answered from the browser or straight
+  from the notification
+- **Web Push** from the daemon itself (no third party), with quiet hours and a
+  per-session quiet alert
+- **Subagents and background tasks** under each session, with a read-along
+  view and a way to message a subagent
+- **Restore after restart**: after a reboot, or a tmux server that dies with
+  sessions in it, the sidebar offers the sessions back in their directory,
+  resuming the agent conversation (`claude --resume`, `codex resume`,
+  `gemini --resume`)
+- **Agents messaging each other** and handing off tasks in a session of
+  their own (`muxdeck-msg`)
+- **Touch**: swipe scrolling while tmux mouse mode is on, a long-press view
+  for selecting and copying text, file upload by drag, paste or key, a key bar
+  that wraps and folds away
+- **Settings panel** (gear in the sidebar): notifications, permission cards,
+  new-session defaults, a project launcher, and an optional link to a
+  dashboard of your own (the icon only shows when a URL is set)
+
+The agent side needs the scripts in
+[`integrations/agents`](integrations/agents/README.md).
+
+Build and install it from source (Go 1.26+, Linux for the agent features):
+
+```sh
+git clone <this repository> ~/src/muxdeck && cd ~/src/muxdeck
+git remote add upstream https://github.com/josecarlosrivas/muxdeck   # for --update
+CGO_ENABLED=0 go build -o ~/.local/bin/muxdeck . && ~/.local/bin/muxdeck service install
+install -m 755 tools/muxdeck-rebuild ~/.local/bin/
+```
+
+From then on `muxdeck-rebuild` builds, tests, installs and restarts it
+(`--check` and `--update` follow upstream releases, and the settings panel
+says when there is a new one; settings in the script's header). The
+installer below and `muxdeck update` download upstream release binaries,
+which do not have these changes: installing one replaces this build.
+
 ## Install
 
 ```sh
