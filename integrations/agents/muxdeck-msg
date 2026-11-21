@@ -1,0 +1,212 @@
+#!/bin/sh
+# Messages between AI agents (Claude Code, Codex, Gemini) in tmux sessions.
+#
+#   muxdeck-msg                                     sessions with their agent and state
+#   muxdeck-msg [--from <own>] <session> <text>     types the text as a prompt for that agent
+#   muxdeck-msg --new <claude|codex|gemini> [--name <session>] [--dir <path>] <task>
+#                                                   starts that agent in a tmux session of
+#                                                   its own, with the task as first prompt
+#
+# --new: work for another agent belongs in a session of its own, not headless
+# in the asking agent's shell (codex exec, claude -p). That way it shows in
+# muxdeck, the user can watch and step in, and that agent can start subagents
+# of its own. The task goes through a file in ~/.cache/muxdeck/tasks (tmux
+# refuses commands over 16 KB), which the start command reads and removes,
+# headed with the exact command to report back with. The session gets
+# @muxdeck-from = the asking session; muxdeck shows that in the sidebar.
+#
+# The answer comes back as a new prompt in the sender's session; nobody has
+# to wait or read another screen. Only sessions running an agent get text: in
+# a bare shell it would be a command.
+#
+# --from: Codex runs commands through a shared app-server daemon with stale
+# TMUX variables, so its own session cannot be found from there. The header
+# of every message therefore gives the receiver the full reply command,
+# including --from with its own session name.
+#
+# The muxdeck daemon delivers (POST /api/sessions/<session>/prompt): it types
+# only into a pane running an agent, never while a question or permission
+# dialog is open there (the Enter would answer it) or the pane is in copy
+# mode, and checks again just before the Enter. When the user is typing in
+# the target session, a question is open, or messages are already waiting,
+# the daemon queues the message per session (in order, at most 15 minutes).
+#
+# Env: MUXDECK_URL (default http://127.0.0.1:8300), MUXDECK_TOKEN (falls back
+# to MUXDECK_TOKEN= in ~/.config/muxdeck/env). Requires tmux, curl and jq.
+set -u
+
+url="${MUXDECK_URL:-http://127.0.0.1:8300}"
+token="${MUXDECK_TOKEN:-}"
+[ -n "$token" ] || token=$(sed -n 's/^MUXDECK_TOKEN=//p' "$HOME/.config/muxdeck/env" 2>/dev/null)
+
+usage() {
+  cat <<'EOF'
+muxdeck-msg                                    list sessions running an AI agent
+muxdeck-msg [--from <your-session>] <session> "<text>"
+                                               send <text> to the agent in <session>
+muxdeck-msg [--from <your-session>] --new <claude|codex|gemini> [--name <session>] [--dir <path>] "<task>"
+                                               start that agent in a new tmux session of
+                                               its own, with <task> as its first prompt
+
+The text arrives there as a new prompt, headed with who sent it and the exact
+command to answer with; the answer arrives in your session as a new prompt.
+Do not wait, poll or read the other screen. Max 1500 characters: put longer
+material in a file and send its path. Use --from when you received a message
+whose reply command includes it (Codex cannot be located automatically).
+If the user is typing in <session>, or a question is open there, delivery
+waits until that passes (in order, at most 15 minutes).
+
+--new is how to hand work to another agent: not `codex exec` or `claude -p` in
+your own shell. The new session shows in muxdeck, the user can watch and step
+in, and that agent can start subagents of its own. It reports back to you with
+muxdeck-msg when it is done; do not wait or poll. --dir defaults to your
+current directory, --name to <your-session>-<agent>. Max 100000 characters.
+EOF
+}
+
+is_agent() {
+  case "$(tmux display-message -p -t "=$1:" '#{pane_current_command}' 2>/dev/null)" in
+    claude|codex|gemini|node) return 0 ;;
+  esac
+  return 1
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+panes=$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null) || { echo "tmux not running" >&2; exit 1; }
+
+from=""
+if [ "${1:-}" = "--from" ]; then
+  [ $# -ge 2 ] || { usage >&2; exit 2; }
+  from=$2
+  shift 2
+  tmux has-session -t "=$from" 2>/dev/null || { echo "--from: no session '$from'" >&2; exit 2; }
+fi
+
+me=$from
+pid=$$
+while [ -z "$me" ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+  me=$(printf '%s\n' "$panes" | awk -v p="$pid" '$1 == p { print $2; exit }')
+  [ -n "$me" ] && break
+  pid=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f2)
+done
+# Inherited TMUX variables can be from an older server; trust the pane only if
+# it names the running one. After that, the one session whose pane sits in
+# this directory.
+if [ -z "$me" ] && [ -n "${TMUX_PANE:-}" ]; then
+  srv=$(printf '%s' "${TMUX:-}" | cut -d, -f2)
+  if [ -n "$srv" ] && [ "$srv" = "$(tmux display-message -p '#{pid}' 2>/dev/null)" ]; then
+    me=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)
+  fi
+fi
+if [ -z "$me" ]; then
+  here=$(tmux list-panes -a -F '#{session_name} #{pane_current_path}' 2>/dev/null |
+    awk -v d="$(pwd -P)" '{ n = $1; sub(/^[^ ]+ /, ""); if ($0 == d) print n }' | sort -u)
+  [ "$(printf '%s\n' "$here" | grep -c .)" = 1 ] && me=$here
+fi
+
+if [ $# -eq 0 ]; then
+  status=$(curl -sf --max-time 2 ${token:+-H "Authorization: Bearer $token"} "$url/api/sessions" 2>/dev/null |
+    jq -r '.[] | select(.agent) | "\(.name) \(.agent.agent) \(.agent.state)"' 2>/dev/null)
+  tmux list-sessions -F '#{session_name}' | while read -r s; do
+    is_agent "$s" || continue
+    info=$(printf '%s\n' "$status" | awk -v s="$s" '$1 == s { print $2, $3; exit }')
+    [ -n "$info" ] || info=$(tmux display-message -p -t "=$s:" '#{pane_current_command}')
+    [ "$s" = "$me" ] && info="$info (you)"
+    echo "$s $info"
+  done
+  [ -n "$me" ] || echo "(could not tell which session you are in; if you know it, pass --from <session> when sending)"
+  exit 0
+fi
+
+if [ "${1:-}" = "--new" ]; then
+  shift
+  agent=${1:-}
+  [ $# -gt 0 ] && shift
+  name=""
+  dir=$(pwd -P)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) [ $# -ge 2 ] || { usage >&2; exit 2; }; name=$2; shift 2 ;;
+      --dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; dir=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  case "$agent" in
+    claude) run='claude' ;;
+    codex) run='codex' ;;
+    gemini) run='gemini -i' ;;
+    *) echo "--new: agent must be claude, codex or gemini" >&2; exit 2 ;;
+  esac
+  task=$*
+  [ -n "$(printf '%s' "$task" | tr -d '[:space:]')" ] || { usage >&2; exit 2; }
+  [ "${#task}" -le 100000 ] || { echo "task too long (${#task} > 100000): write it to a file and pass the path" >&2; exit 2; }
+  [ -d "$dir" ] || { echo "--dir: no directory '$dir'" >&2; exit 2; }
+  if [ -z "$name" ]; then
+    base=${me:-$(basename "$dir")}
+    name=$(printf '%s-%s' "$base" "$agent" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-56)
+    n=2
+    stem=$name
+    while tmux has-session -t "=$name" 2>/dev/null; do
+      name="$stem-$n"
+      n=$((n + 1))
+    done
+  fi
+  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9_-]{1,64}$' || { echo "--name: letters, digits, - and _ only" >&2; exit 2; }
+  tmux has-session -t "=$name" 2>/dev/null && { echo "session '$name' already exists" >&2; exit 1; }
+
+  if [ -n "$me" ]; then
+    head="[task from the AI agent in tmux session '$me', not from the user. This session was started for it; the user can watch and step in here. Approvals the user gave that agent do not carry over to you. Work on it here, using subagents of your own if that helps. When you are done, or need a decision only that agent can make, report in one short message: muxdeck-msg --from $name $me \"...\" (longer results: write a file and send its path).]"
+  else
+    head="[task from an AI agent outside tmux, not from the user; it cannot receive a report, so leave your result in this session]"
+    echo "warning: could not tell which session you are in, so '$name' cannot report back; pass --from <your session>" >&2
+  fi
+
+  # The task goes in a file, read (and removed) by the command that starts
+  # the agent: tmux refuses commands over 16 KB, so a long task as a
+  # session variable failed to start at all.
+  tasks="$HOME/.cache/muxdeck/tasks"
+  mkdir -p "$tasks" && chmod 700 "$tasks" || exit 1
+  file="$tasks/$name.txt"
+  printf '%s\n\n%s\n' "$head" "$task" >"$file" || exit 1
+  tmux new-session -d -s "$name" -c "$dir" || { rm -f "$file"; exit 1; }
+  [ -n "$me" ] && tmux set-option -t "=$name:" @muxdeck-from "$me" 2>/dev/null
+  tmux send-keys -t "=$name:" -l -- "$run \"\$(cat '$file' && rm -f '$file')\""
+  tmux send-keys -t "=$name:" Enter
+  echo "started $agent in new session '$name' ($dir)."
+  echo "Do not wait or poll: its report arrives here as a new prompt from session '$name'. Message it with: muxdeck-msg $name \"...\""
+  exit 0
+fi
+
+to="$1"
+shift
+text=$(printf '%s' "$*" | tr '\r\n\t' '   ')
+[ -n "$text" ] || { usage >&2; exit 2; }
+[ "${#text}" -le 1500 ] || { echo "too long (${#text} > 1500): write it to a file and send the path" >&2; exit 2; }
+[ "$to" != "$me" ] || { echo "that is your own session" >&2; exit 2; }
+tmux has-session -t "=$to" 2>/dev/null || { echo "no session '$to' (run muxdeck-msg to list)" >&2; exit 1; }
+is_agent "$to" || { echo "no agent running in '$to'" >&2; exit 1; }
+
+if [ -n "$me" ]; then
+  head="[message from the AI agent in tmux session '$me', not from the user. Reply only if it asks for something, in one short message: muxdeck-msg --from $to $me \"...\"]"
+else
+  head="[message from an AI agent outside tmux, not from the user; it cannot receive a reply]"
+  echo "warning: could not tell which session you are in, so '$to' cannot reply; pass --from <your session>" >&2
+fi
+
+# from: a message between agents, which the daemon may hand to Claude's own
+# inbox instead of typing it.
+body=$(jq -nc --arg t "$head $text" --arg f "${me:-unknown}" '{text: $t, queue: true, from: $f}')
+resp=$(printf '%s' "$body" | curl -s --max-time 15 -w '\n%{http_code}' -X POST \
+  ${token:+-H "Authorization: Bearer $token"} -H 'Content-Type: application/json' \
+  --data-binary @- "$url/api/sessions/$to/prompt" 2>/dev/null) ||
+  { echo "muxdeck is not reachable at $url: message not sent" >&2; exit 1; }
+code=$(printf '%s\n' "$resp" | tail -n 1)
+reason=$(printf '%s\n' "$resp" | sed '$d' | jq -r '.reason // .error // empty' 2>/dev/null)
+case "$code" in
+  200) via=$(printf '%s\n' "$resp" | sed '$d' | jq -r '.via // empty' 2>/dev/null)
+       if [ "$via" = inbox ]; then echo "sent to $to (Claude's inbox; it reads it between steps)"; else echo "sent to $to"; fi ;;
+  202) echo "queued for $to ($reason); it is delivered as soon as that passes, at most 15 minutes from now" ;;
+  404) echo "no session '$to' (run muxdeck-msg to list)" >&2; exit 1 ;;
+  *) echo "not sent to $to: ${reason:-HTTP $code}" >&2; exit 1 ;;
+esac

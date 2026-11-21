@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Reports running Codex sessions to muxdeck (model, ctx/5h/7d chips, state).
+
+Codex has no statusline hook, but its TUI keeps its rollout log
+(~/.codex/sessions/**/rollout-*.jsonl) open. For each tmux session we look
+for the Codex process under its panes, read the new lines of that log and
+post to /api/agent/status:
+  task_started  -> working
+  task_complete -> waiting (muxdeck then notifies)
+  Codex gone    -> idle, chips cleared
+When Codex's own hooks run (~/.codex/hooks.json -> muxdeck-agent.sh with
+MUXDECK_AGENT=codex), they write the state per tmux session plus the
+conversation they speak for ($XDG_RUNTIME_DIR/muxdeck-agent/<session>.sid).
+For that conversation the watcher takes their state and note; it then only
+adds the model, the chips and questions on screen.
+Permission prompts are not in the log. So the watcher also reads the bottom
+of the Codex screen: an approval prompt or the folder trust screen there is
+reported as waiting with the question as note (muxdeck: "needs you" plus a
+notification). Once the question is gone, the log's state applies again.
+
+Linux only (reads /proc). Env: MUXDECK_URL (default http://127.0.0.1:8300),
+MUXDECK_TOKEN (falls back to MUXDECK_TOKEN= in ~/.config/muxdeck/env).
+"""
+import json
+import os
+import subprocess
+import time
+import traceback
+import urllib.request
+
+URL = os.environ.get("MUXDECK_URL", "http://127.0.0.1:8300")
+INTERVAL = 2
+IDLE_INTERVAL = 10  # while no codex process runs anywhere
+
+
+def token():
+    t = os.environ.get("MUXDECK_TOKEN")
+    if t:
+        return t
+    try:
+        with open(os.path.expanduser("~/.config/muxdeck/env")) as f:
+            for line in f:
+                if line.startswith("MUXDECK_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+TOKEN = token()
+
+
+def post(payload):
+    req = urllib.request.Request(
+        URL + "/api/agent/status",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=2).read()
+    except Exception:
+        pass
+
+
+def children_map():
+    """Children per pid, and whether a codex process runs anywhere (comm is
+    in stat already, so that costs nothing extra)."""
+    kids = {}
+    codex = False
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read()
+            head, tail = st.rsplit(")", 1)
+            ppid = int(tail.split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        if head.partition("(")[2].startswith("codex"):
+            codex = True
+        kids.setdefault(ppid, []).append(int(pid))
+    return kids, codex
+
+
+HEADS = {}  # path -> does the log have a parent_thread_id (= subagent)?
+
+
+def is_child(path):
+    if path not in HEADS:
+        try:
+            with open(path, "rb") as f:
+                first = json.loads(f.readline())
+            meta = (first.get("payload") if isinstance(first, dict) else None) or {}
+        except (OSError, ValueError):
+            return False
+        if not isinstance(meta, dict):
+            meta = {}
+        src = meta.get("source")
+        spawned = isinstance(src, dict) and "subagent" in src
+        HEADS[path] = bool(meta.get("parent_thread_id")) or spawned
+    return HEADS[path]
+
+
+def rollout_of(root, kids):
+    """The rollout log of the main conversation under this pane. When Codex
+    starts subagents, the same process keeps their logs open too: those drop out."""
+    found = []
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        stack.extend(kids.get(pid, []))
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if "/.codex/sessions/" in target and os.path.basename(target).startswith("rollout-") \
+                    and target.endswith(".jsonl") and target not in found:
+                found.append(target)
+    roots = [p for p in found if not is_child(p)]
+    return (roots or found or [None])[0]
+
+
+def runs_codex(root, kids):
+    """Does a Codex process run under this pane (even one without a rollout
+    log open yet, as on the folder trust screen)?"""
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        stack.extend(kids.get(pid, []))
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        for a in args[:2]:
+            base = os.path.basename(a.decode(errors="replace"))
+            if base in ("codex", "codex.js"):
+                return True
+    return False
+
+
+def panes():
+    """(session, pane pid, pane id) per pane. The name comes last: it cannot
+    hold a tab, but this way it can never shift the pane id either."""
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{pane_id}\t#{session_name}"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except Exception:
+        return []
+    res = []
+    for line in out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            res.append((parts[2], int(parts[0]), parts[1]))
+    return res
+
+
+def screen(pane_id):
+    try:
+        return subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except Exception:
+        return ""
+
+
+# What Codex puts at the bottom while it waits for the user to choose.
+QUESTION_MARKS = (
+    "Press enter to confirm or esc to cancel",
+    "Would you like to run the following command?",
+    "Would you like to make the following edits?",
+    # Screens before the start (folder trust, update offer): "esc back",
+    # "esc skip", ... the footer always starts like this.
+    "enter continue · esc ",
+)
+
+
+def codex_question(text):
+    """The open question on screen as a short note, or None."""
+    # Only the bottom: that is where a question sits. Higher up is the
+    # conversation, which can hold the same words (a diff of this script).
+    lines = [l.rstrip() for l in text.rstrip().splitlines() if l.strip()][-15:]
+    tail = "\n".join(lines)
+    if not any(m in tail for m in QUESTION_MARKS):
+        return None
+    if "Folder access" in tail:
+        return "Codex asks whether to open this folder"
+    if "Update available" in tail:
+        return "Codex offers an update before it starts"
+    cmd = next((l.strip()[2:].strip() for l in lines if l.strip().startswith("$ ")), "")
+    if cmd:
+        return ("Codex needs your approval: " + cmd)[:200]
+    if "following edits" in tail:
+        return "Codex needs your approval for file changes"
+    return "Codex is asking you something"
+
+
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "muxdeck-agent")
+
+
+def hook_state(session, rollout):
+    """(state, note) from the Codex hooks for this conversation, or None."""
+    base = os.path.basename(rollout or "")[:-len(".jsonl")]
+    try:
+        with open(os.path.join(STATE_DIR, session + ".sid")) as f:
+            agent, _, sid = f.read().strip().partition(" ")
+        if agent != "codex" or len(sid) != 36 or not base.endswith(sid):
+            return None
+        with open(os.path.join(STATE_DIR, session)) as f:
+            state = f.read().strip()
+        with open(os.path.join(STATE_DIR, session + ".note")) as f:
+            note = f.read().strip()
+    except OSError:
+        return None
+    if state not in ("working", "waiting", "idle"):
+        return None
+    return state, note
+
+
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def reset_at(t, day):
+    if not t:
+        return ""
+    tm = time.localtime(t)
+    return " · " + (DAYS[tm.tm_wday] + " " if day else "") + time.strftime("%H:%M", tm)
+
+
+class Log:
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+        self.buf = b""
+        self.model = ""
+        self.state = "idle"
+        self.ctx = self.rl5 = self.rl7 = None
+        self.reset5 = self.reset7 = None
+
+    def read(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:
+            return
+        self.offset += len(data)
+        lines = (self.buf + data).split(b"\n")
+        self.buf = lines.pop()
+        for raw in lines:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            p = ev.get("payload") or {}
+            if not isinstance(p, dict):
+                continue
+            if ev.get("type") == "turn_context":
+                self.model = p.get("model") or self.model
+            elif ev.get("type") == "event_msg":
+                t = p.get("type")
+                if t == "task_started":
+                    self.state = "working"
+                elif t == "task_complete":
+                    self.state = "waiting"
+                elif t == "token_count":
+                    info = p.get("info") or {}
+                    win = info.get("model_context_window")
+                    last = (info.get("last_token_usage") or {}).get("total_tokens")
+                    if win and last is not None:
+                        self.ctx = 100 * last / win
+                    rl = p.get("rate_limits") or {}
+                    prim, sec = rl.get("primary") or {}, rl.get("secondary") or {}
+                    self.rl5 = prim.get("used_percent", self.rl5)
+                    self.rl7 = sec.get("used_percent", self.rl7)
+                    self.reset5 = prim.get("resets_at", self.reset5)
+                    self.reset7 = sec.get("resets_at", self.reset7)
+
+    def payload(self, session):
+        chips = []
+        for key, lbl, icon, v, at, day in (
+            ("context window", "ctx", None, self.ctx, None, False),
+            ("5-hour limit", "5h", "clock", self.rl5, self.reset5, False),
+            ("7-day limit", "7d", "clock", self.rl7, self.reset7, True),
+        ):
+            if v is None:
+                continue
+            c = {"key": key, "value": f"{lbl} {round(v)}%{reset_at(at, day)}"}
+            if at:
+                c["resets_at"] = int(at)
+            if icon:
+                c["icon"] = icon
+            if v >= 90:
+                c["color"] = "danger"
+            elif v >= 70:
+                c["color"] = "warn"
+            chips.append(c)
+        note = "Codex is done and waiting for you" if self.state == "waiting" else ""
+        return {"session": session, "agent": "codex", "state": self.state,
+                "model": self.model, "note": note, "chips": chips, "transcript": self.path}
+
+
+def main():
+    logs = {}      # path -> Log
+    sent = {}      # session -> last posted payload
+    stamp = {}     # session -> time of last post; muxdeck forgets everything on a restart
+    while True:
+        try:
+            idle = tick(logs, sent, stamp)
+        except Exception:
+            # One odd line or a tmux hiccup must not crash the watcher:
+            # it would start over at offset 0 every time.
+            traceback.print_exc()
+            idle = False
+        if len(HEADS) > 1000:
+            HEADS.clear()
+        time.sleep(IDLE_INTERVAL if idle else INTERVAL)
+
+
+def tick(logs, sent, stamp):
+    """One pass; True when there is nothing to follow (no codex, nothing reported)."""
+    kids, any_codex = children_map()
+    if not any_codex and not sent:
+        logs.clear()
+        return True
+    found = {}
+    pane_of = {}
+    asking = {}  # session -> question, for Codex without a log (before it starts)
+    for name, pid, pane_id in panes():
+        if name in found:
+            continue
+        path = rollout_of(pid, kids)
+        if path:
+            found[name] = path
+            pane_of[name] = pane_id
+            asking.pop(name, None)
+        elif name not in asking and runs_codex(pid, kids):
+            q = codex_question(screen(pane_id))
+            if q:
+                asking[name] = q
+    for name, q in asking.items():
+        if name in found:
+            continue
+        p = {"session": name, "agent": "codex", "state": "waiting", "model": "",
+             "note": q, "chips": []}
+        if sent.get(name) != p or time.time() - stamp.get(name, 0) > 60:
+            post(p)
+            sent[name] = p
+            stamp[name] = time.time()
+    for name, path in found.items():
+        log = logs.get(path)
+        if log is None:
+            log = logs[path] = Log(path)
+        log.read()
+        p = log.payload(name)
+        hs = hook_state(name, path)
+        if hs:
+            p["state"], p["note"] = hs
+        q = codex_question(screen(pane_of[name]))
+        if q:
+            p["state"] = "waiting"
+            p["note"] = q
+        if sent.get(name) != p or time.time() - stamp.get(name, 0) > 60:
+            post(p)
+            sent[name] = p
+            stamp[name] = time.time()
+    for name in list(sent):
+        if name not in found and name not in asking:
+            post({"session": name, "agent": "codex", "state": "idle",
+                  "note": "", "chips": [], "progress": {}})
+            del sent[name]
+            stamp.pop(name, None)
+    live = set(found.values())
+    for path in list(logs):
+        if path not in live:
+            del logs[path]
+    return False
+
+
+if __name__ == "__main__":
+    main()

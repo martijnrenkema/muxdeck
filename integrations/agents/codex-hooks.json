@@ -1,0 +1,20 @@
+{
+  "description": "muxdeck: Codex status, done notifications and permission cards (muxdeck-agent.sh)",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "MUXDECK_AGENT=codex sh $HOME/.claude/muxdeck-agent.sh state working", "timeout": 5 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "MUXDECK_AGENT=codex sh $HOME/.claude/muxdeck-agent.sh state waiting", "timeout": 5 } ] }
+    ],
+    "Interrupt": [
+      { "hooks": [ { "type": "command", "command": "MUXDECK_AGENT=codex sh $HOME/.claude/muxdeck-agent.sh state waiting", "timeout": 3 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "MUXDECK_AGENT=codex sh $HOME/.claude/muxdeck-agent.sh state idle", "timeout": 3 } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "MUXDECK_AGENT=codex sh $HOME/.claude/muxdeck-agent.sh permission", "timeout": 150, "statusMessage": "Waiting for an answer in muxdeck" } ] }
+    ]
+  }
+}

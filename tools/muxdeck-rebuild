@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Builds muxdeck from a source tree, installs it and restarts the service.
+#
+#   muxdeck-rebuild            build the current branch, test, install, restart
+#   muxdeck-rebuild --check    only check whether upstream has a newer release
+#   muxdeck-rebuild --update   rebase the branch onto the newest upstream tag, then build
+#
+# --update rebases a temporary branch; the branch itself only moves once vet,
+# tests and the build pass on it. On a conflict or a failure everything stays
+# as it was and the running binary carries on.
+#
+# A restart that fails puts the previous binary back. After a good install,
+# the agent scripts from integrations/agents that are installed already (see
+# integrations/agents/README.md) are updated in place, each with a
+# .bak-<date> of the previous version.
+#
+# Settings come from the environment, or from KEY=value lines in
+# ~/.config/muxdeck/rebuild.env (the environment wins):
+#   MUXDECK_SRC        source tree (default: the tree this script is in, else ~/src/muxdeck)
+#   MUXDECK_BRANCH     branch to build (default: the branch checked out)
+#   MUXDECK_UPSTREAM   remote with the upstream release tags
+#                      (default: "upstream" when that remote exists, else "origin")
+#   MUXDECK_BIN        binary to replace (default: muxdeck on PATH, else ~/.local/bin/muxdeck)
+#   MUXDECK_SUFFIX     version suffix: v0.14.12-<suffix> (default: src)
+#   MUXDECK_SERVICE    systemd user service to restart (default: muxdeck; "none" to skip)
+#   MUXDECK_PUSH       remote to push the branch and tags to afterwards (default: none)
+#   MUXDECK_PATCH_DIR  directory to export the commits on top of upstream to, as
+#                      patches (default: none)
+# Needs git and Go (also looked for in ~/.local/go/bin); node checks the JS when present.
+set -euo pipefail
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/muxdeck/rebuild.env"
+if [[ -f "$conf" ]]; then
+  while IFS='=' read -r key val; do
+    [[ "$key" =~ ^MUXDECK_[A-Z_]+$ ]] || continue
+    [[ -n "${!key+x}" ]] && continue
+    val=${val%\"}; val=${val#\"}
+    [[ "$val" == "~"* ]] && val="$HOME${val:1}"
+    printf -v "$key" '%s' "$val"
+  done <"$conf"
+fi
+
+here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+if [[ -z "${MUXDECK_SRC:-}" ]]; then
+  if [[ -f "$here/go.mod" && -d "$here/integrations/agents" ]]; then
+    MUXDECK_SRC=$here
+  else
+    MUXDECK_SRC=$HOME/src/muxdeck
+  fi
+fi
+SRC=$MUXDECK_SRC
+[[ -f "$SRC/go.mod" ]] || { echo "no muxdeck source tree at $SRC (set MUXDECK_SRC)" >&2; exit 1; }
+cd "$SRC"
+
+BRANCH=${MUXDECK_BRANCH:-$(git symbolic-ref --short -q HEAD || true)}
+[[ -n "$BRANCH" ]] || { echo "no branch checked out in $SRC (set MUXDECK_BRANCH)" >&2; exit 1; }
+if [[ -n "${MUXDECK_UPSTREAM:-}" ]]; then
+  UPSTREAM=$MUXDECK_UPSTREAM
+elif git remote | grep -qx upstream; then
+  UPSTREAM=upstream
+else
+  UPSTREAM=origin
+fi
+BIN=${MUXDECK_BIN:-$(command -v muxdeck || echo "$HOME/.local/bin/muxdeck")}
+SUFFIX=${MUXDECK_SUFFIX:-src}
+SERVICE=${MUXDECK_SERVICE:-muxdeck}
+[[ "$SERVICE" == none ]] && SERVICE=""
+PUSH=${MUXDECK_PUSH:-}
+PATCH_DIR=${MUXDECK_PATCH_DIR:-}
+TMP_BRANCH=rebuild-update
+[[ -d "$HOME/.local/go/bin" ]] && export PATH="$HOME/.local/go/bin:$PATH"
+command -v go >/dev/null || { echo "Go is not installed (looked on PATH and in ~/.local/go/bin)" >&2; exit 1; }
+
+git fetch -q "$UPSTREAM" --tags || echo "git fetch $UPSTREAM failed (offline?), going on with what is here" >&2
+
+base=$(git describe --tags --abbrev=0 "$BRANCH")
+latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+echo "$BRANCH is on: $base   newest upstream: $latest"
+echo "own commits: $(git rev-list --count "$base..$BRANCH")"
+
+if [[ "${1:-}" == "--check" ]]; then
+  [[ "$base" == "$latest" ]] && echo "up to date" || echo "update available: muxdeck-rebuild --update"
+  exit 0
+fi
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "the work tree has uncommitted changes, commit them first" >&2
+  exit 1
+fi
+git checkout -q "$BRANCH"
+
+# Vet, tests and build; on a failure show the output instead of stopping
+# without a word.
+check_and_build() {
+  local log
+  log=$(mktemp)
+  if ! { go vet ./... && go test ./internal/... &&
+    { ! command -v node >/dev/null || { node --check web/app.js && node --check web/sw.js; }; }; } >"$log" 2>&1; then
+    echo "vet/tests failed:" >&2
+    grep -E -- "FAIL|panic|error|\.go:[0-9]+" "$log" | head -40 >&2 || tail -40 "$log" >&2
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+  mkdir -p "$(dirname "$BIN")"
+  CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$1" -o "$BIN.new" .
+}
+
+updating=false
+if [[ "${1:-}" == "--update" && "$base" != "$latest" ]]; then
+  echo "rebase $base -> $latest (on temporary branch $TMP_BRANCH)"
+  git checkout -q -B "$TMP_BRANCH" "$BRANCH"
+  if ! git rebase -q --onto "$latest" "$base" "$TMP_BRANCH"; then
+    git rebase --abort 2>/dev/null || true
+    git checkout -q "$BRANCH"
+    git branch -q -D "$TMP_BRANCH"
+    echo "conflict during the rebase: nothing changed. Resolve it by hand (git rebase --onto $latest $base $BRANCH)" >&2
+    exit 1
+  fi
+  if ! check_and_build "$latest-$SUFFIX"; then
+    git checkout -q "$BRANCH"
+    git branch -q -D "$TMP_BRANCH"
+    echo "the build fails after the rebase: $BRANCH was not touched" >&2
+    exit 1
+  fi
+  git checkout -q -B "$BRANCH" "$TMP_BRANCH"
+  git branch -q -D "$TMP_BRANCH"
+  base=$latest
+  updating=true
+fi
+
+version="$base-$SUFFIX"
+if ! $updating; then
+  check_and_build "$version" || exit 1
+fi
+
+had_bin=false
+if [[ -f "$BIN" ]]; then
+  cp "$BIN" "$BIN.prev"
+  had_bin=true
+fi
+mv "$BIN.new" "$BIN"
+
+if [[ -n "$SERVICE" ]] && systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
+  systemctl --user restart "$SERVICE" || true
+  # A crash right after the start counts too: look twice.
+  ok=true
+  for _ in 1 2; do
+    sleep 2
+    systemctl --user is-active -q "$SERVICE" || ok=false
+  done
+  if ! $ok; then
+    echo "$SERVICE does not start" >&2
+    journalctl --user -u "$SERVICE" -n 15 --no-pager >&2 || true
+    if $had_bin; then
+      echo "putting the previous version back" >&2
+      mv "$BIN.prev" "$BIN"
+      systemctl --user reset-failed "$SERVICE" 2>/dev/null || true
+      systemctl --user restart "$SERVICE"
+    fi
+    exit 1
+  fi
+else
+  echo "installed $BIN; no systemd user service '$SERVICE' found, so restart muxdeck yourself" \
+    "(muxdeck service install sets one up)"
+fi
+
+if [[ -n "$PATCH_DIR" ]]; then
+  # Patches into a new directory first, then replace the old ones.
+  patches=$(mktemp -d)
+  git format-patch -q "$base" -o "$patches"
+  mkdir -p "$PATCH_DIR"
+  rm -f "$PATCH_DIR"/0*.patch
+  if compgen -G "$patches/*.patch" >/dev/null; then
+    mv "$patches"/*.patch "$PATCH_DIR"/
+  fi
+  rmdir "$patches"
+fi
+
+# Update the agent scripts that are installed, where they run.
+stamp=$(date +%Y%m%d-%H%M)
+update_script() { # source destination
+  local src="$SRC/$1" dst=$2
+  [[ -f "$src" && -f "$dst" ]] || return 1
+  cmp -s "$src" "$dst" && return 1
+  cp -p "$dst" "$dst.bak-$stamp"
+  # New file, then rename: a shell still reading the old script keeps its
+  # own inode.
+  install -m 755 "$src" "$dst.new" && mv "$dst.new" "$dst"
+  echo "updated: $dst"
+}
+update_script integrations/agents/muxdeck-msg "$HOME/.local/bin/muxdeck-msg" || true
+update_script tools/muxdeck-rebuild "$HOME/.local/bin/muxdeck-rebuild" || true
+update_script integrations/agents/muxdeck-agent.sh "$HOME/.claude/muxdeck-agent.sh" || true
+if update_script integrations/agents/muxdeck-codex-watch "$HOME/.local/bin/muxdeck-codex-watch"; then
+  systemctl --user restart muxdeck-codex-watch 2>/dev/null || echo "restarting muxdeck-codex-watch failed" >&2
+fi
+
+if [[ -n "$PUSH" ]] && git remote | grep -qx "$PUSH"; then
+  git push -q --force-with-lease "$PUSH" "$BRANCH" && git push -q "$PUSH" --tags ||
+    echo "push to $PUSH failed (no harm, everything is here locally)"
+fi
+
+echo "running: $("$BIN" -version 2>/dev/null || echo "$version")"

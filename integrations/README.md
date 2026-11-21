@@ -73,6 +73,10 @@ the statusline pipe carries model + cumulative cost every turn, and the
 `UserPromptSubmit` / `Notification` / `Stop` hooks map to
 `working` / `waiting` / `idle`.
 
+For permission cards, done notifications with Web Push, Codex and Gemini
+support and agents messaging each other, use the fuller adapter in
+[`agents/`](agents/README.md) instead.
+
 The statusline pipe also carries the lines the session has added and removed,
 which the adapter sends as a `diff` chip — a worked example of the chip shape
 and the one number that says how much a long agent run has actually touched.
