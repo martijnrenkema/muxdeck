@@ -68,11 +68,21 @@ The agent side needs the scripts in
 Build and install it from source (Go 1.26+, Linux for the agent features):
 
 ```sh
-git clone <this repository> ~/src/muxdeck && cd ~/src/muxdeck
+git clone https://github.com/martijnrenkema/muxdeck ~/src/muxdeck && cd ~/src/muxdeck
 git remote add upstream https://github.com/josecarlosrivas/muxdeck   # for --update
-CGO_ENABLED=0 go build -o ~/.local/bin/muxdeck . && ~/.local/bin/muxdeck service install
+CGO_ENABLED=0 go build -o ~/.local/bin/muxdeck .
+~/.local/bin/muxdeck service install -no-claim
 install -m 755 tools/muxdeck-rebuild ~/.local/bin/
 ```
+
+`-no-claim` keeps the daemon off muxdeck cloud. It listens on loopback
+without a token, which is fine on the machine itself. To use it from a phone
+or another computer, put it behind HTTPS (Web Push only works there), for
+example with `tailscale serve --https=443 http://127.0.0.1:8300`. Requests
+then arrive over loopback too, so give the daemon a token: install the
+service with `-service-token <token>`, and put the same token on a line
+`MUXDECK_TOKEN=<token>` in `~/.config/muxdeck/env`, where the agent scripts
+read it.
 
 From then on `muxdeck-rebuild` builds, tests, installs and restarts it
 (`--check` and `--update` follow upstream releases, and the settings panel
