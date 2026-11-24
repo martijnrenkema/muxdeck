@@ -238,6 +238,7 @@ const (
 
 type queuedPrompt struct {
 	text  string
+	from  string // sending agent's session, told when the message is dropped
 	added time.Time
 }
 
@@ -247,14 +248,14 @@ type promptQueue struct {
 	running map[string]bool
 }
 
-func (q *promptQueue) push(session, text string) int {
+func (q *promptQueue) push(session, text, from string) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.m == nil {
 		q.m = map[string][]queuedPrompt{}
 		q.running = map[string]bool{}
 	}
-	q.m[session] = append(q.m[session], queuedPrompt{text, time.Now()})
+	q.m[session] = append(q.m[session], queuedPrompt{text, from, time.Now()})
 	return len(q.m[session])
 }
 
@@ -271,8 +272,9 @@ func typing(session string) bool {
 
 // enqueue holds a prompt until the session can take it and starts the
 // session's worker if it has none. Messages go out in the order they came.
-func (s *Server) enqueuePrompt(session, text string) {
-	s.prompts.push(session, text)
+// from is the session of the agent that sent it, or "".
+func (s *Server) enqueuePrompt(session, text, from string) {
+	s.prompts.push(session, text, from)
 	q := &s.prompts
 	q.mu.Lock()
 	start := !q.running[session]
@@ -303,14 +305,18 @@ func (s *Server) promptWorker(session string) {
 				q.m[session] = q.m[session][1:]
 			}
 			q.mu.Unlock()
+			s.tellSender(head.from, session, why)
 		}
 		if ok, err := tmux.Exists(session); err == nil && !ok {
 			q.mu.Lock()
-			n := len(q.m[session])
+			waiting := q.m[session]
 			delete(q.m, session)
 			q.running[session] = false
 			q.mu.Unlock()
-			log.Printf("prompt: %s: session ended, dropped %d queued message(s)", session, n)
+			log.Printf("prompt: %s: session ended, dropped %d queued message(s)", session, len(waiting))
+			for _, m := range waiting {
+				s.tellSender(m.from, session, "that session has ended")
+			}
 			return
 		}
 		if time.Since(head.added) > promptMaxWait {
@@ -334,6 +340,26 @@ func (s *Server) promptWorker(session string) {
 			drop(ref.Msg)
 		}
 	}
+}
+
+// tellSender lets the agent that sent a queued message know it was never
+// delivered: it was told "queued", and would otherwise wait for an answer
+// to a message nobody got. The notice itself has no sender, so a notice
+// that cannot be delivered ends there.
+func (s *Server) tellSender(from, to, why string) {
+	if from == "" || from == to || !tmux.ValidName(from) {
+		return
+	}
+	if ok, err := tmux.Exists(from); err != nil || !ok {
+		return
+	}
+	text := "[muxdeck, not from the user: your message to the agent in tmux session '" + to +
+		"' was queued but not delivered (" + why + "). Send it again if it still matters.]"
+	if sock := s.inboxOf(from); sock != "" && deliverInbox(sock, text) == nil {
+		log.Printf("prompt: %s: told its agent that a message for %s was dropped", from, to)
+		return
+	}
+	s.enqueuePrompt(from, text, "")
 }
 
 // handlePrompt types a prompt into the agent of a session (muxdeck-msg).
@@ -374,7 +400,7 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	queued := func(why string) {
-		s.enqueuePrompt(name, body.Text)
+		s.enqueuePrompt(name, body.Text, body.From)
 		writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "reason": why})
 	}
 	if body.Queue && s.prompts.len(name) > 0 {

@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -144,5 +145,37 @@ func TestSubscribeRejectsBadKeys(t *testing.T) {
 	}
 	if m.Subscribe(Subscription{Endpoint: "https://ok/x", P256dh: "AAAA", Auth: "AAAA"}) == nil {
 		t.Fatal("accepted short keys")
+	}
+}
+
+func TestSubscribeAgainKeepsDate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "push.json")
+	m, err := Open(path, "mailto:t@example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ua, _ := ecdh.P256().GenerateKey(rand.Reader)
+	sub := Subscription{Endpoint: "https://push.example/x", P256dh: b64.EncodeToString(ua.PublicKey().Bytes()), Auth: b64.EncodeToString(make([]byte, 16))}
+	if err := m.Subscribe(sub); err != nil {
+		t.Fatal(err)
+	}
+	first := m.List()[0].Added
+	fi, _ := os.Stat(path)
+	time.Sleep(20 * time.Millisecond)
+	if err := m.Subscribe(sub); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.List(); len(got) != 1 || !got[0].Added.Equal(first) {
+		t.Errorf("subscribing again: %d devices, added %v, want 1 and %v", len(got), got[0].Added, first)
+	}
+	if fi2, _ := os.Stat(path); !fi2.ModTime().Equal(fi.ModTime()) {
+		t.Error("an unchanged subscription rewrote the file")
+	}
+	sub.Label = "Phone"
+	if err := m.Subscribe(sub); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.List(); len(got) != 1 || got[0].Label != "Phone" || !got[0].Added.Equal(first) {
+		t.Errorf("a new label: %+v", got)
 	}
 }

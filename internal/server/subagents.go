@@ -29,7 +29,10 @@ func (s *Server) watchSubagents() {
 	defer t.Stop()
 	for range t.C {
 		if tmux.Found {
-			s.statusFromRegistry(s.subs.DiscoverClaude(tmux.PanePIDs()))
+			panes := tmux.PanePIDs()
+			live := s.subs.DiscoverClaude(panes)
+			s.statusFromRegistry(live)
+			s.claudeGone(panes, live)
 		}
 		if s.subs.Scan() {
 			s.changes.bump()
@@ -71,6 +74,70 @@ func (s *Server) statusFromRegistry(live []subagent.Live) {
 		}
 		s.agents.Set(l.Session, st)
 		s.regOwned[l.Session] = true
+		changed = true
+	}
+	if changed {
+		s.changes.bump()
+	}
+}
+
+// A Claude the registry listed and no longer does, this many scans in a
+// row, has ended.
+const regGoneScans = 3
+
+// claudeGone settles sessions whose Claude ended without saying so (killed,
+// crashed, out of memory): no SessionEnd hook ran, so the row would say
+// "working" for as long as the session lives. Only a session the registry
+// had a Claude for is judged, and only while tmux answers: a Claude the
+// registry never listed is left to its hooks.
+func (s *Server) claudeGone(panes map[string][]int, live []subagent.Live) {
+	if len(panes) == 0 {
+		return
+	}
+	here := map[string]bool{}
+	for _, l := range live {
+		here[l.Session] = true
+	}
+	s.regMu.Lock()
+	if s.regSeen == nil {
+		s.regSeen = map[string]int{}
+	}
+	if s.regOwned == nil {
+		s.regOwned = map[string]bool{}
+	}
+	var gone []string
+	for name := range here {
+		s.regSeen[name] = 0
+	}
+	for name, missed := range s.regSeen {
+		switch {
+		case here[name]:
+		case panes[name] == nil:
+			delete(s.regSeen, name) // the session itself ended
+		case missed+1 < regGoneScans:
+			s.regSeen[name] = missed + 1
+		default:
+			delete(s.regSeen, name)
+			gone = append(gone, name)
+		}
+	}
+	s.regMu.Unlock()
+	changed := false
+	for _, name := range gone {
+		st, ok := s.agents.Get(name)
+		if !ok || st.Agent != "claude-code" || st.State == agent.StateIdle {
+			continue
+		}
+		log.Printf("agent: %s: Claude is gone without a SessionEnd (was %s), now idle", name, st.State)
+		st.State, st.Note = agent.StateIdle, ""
+		s.agents.Set(name, st)
+		s.subs.Track(name, "claude-code", "", agent.StateIdle)
+		s.noteConversation(name, "claude-code", "", "", agent.StateIdle)
+		s.blocks.clear(name)
+		// The registry may speak for the session again when a new Claude starts.
+		s.regMu.Lock()
+		s.regOwned[name] = true
+		s.regMu.Unlock()
 		changed = true
 	}
 	if changed {

@@ -1,7 +1,7 @@
 // Minimal service worker: makes muxdeck installable as a PWA and keeps the
 // shell loadable. Network-first so deploys are never masked by stale caches;
 // the app is useless offline anyway (it needs a live WebSocket).
-const CACHE = "muxdeck-v6";
+const CACHE = "muxdeck-v7";
 const ASSETS = [
   "/",
   "/style.css",
@@ -52,9 +52,14 @@ self.addEventListener("push", (e) => {
   try { m = e.data?.json() || {}; } catch {}
   const max = self.Notification?.maxActions ?? 2;
   // A question's options come with their own labels (titles).
-  const actions = (m.perm || m.block ? m.actions || [] : [])
-    .map((a, i) => ({ action: a, title: PERM_TITLES[a] || m.titles?.[i] || a }))
-    .slice(0, max);
+  const all = (m.perm || m.block ? m.actions || [] : [])
+    .map((a, i) => ({ action: a, title: PERM_TITLES[a] || m.titles?.[i] || a }));
+  // The options of a question go on buttons only when all of them fit: two
+  // out of three would look like the whole choice. Otherwise a tap opens the
+  // card, which has room for every option.
+  const partial = all.length > max && all.some((a) => a.action.startsWith("opt:"));
+  const actions = partial ? [] : all.slice(0, max);
+  if (partial) m.body = `${m.body || ""}\nTap to choose from ${all.length} options`.trim();
   e.waitUntil(Promise.all([
     closeExpired(),
     self.registration.showNotification(m.title || "muxdeck", {

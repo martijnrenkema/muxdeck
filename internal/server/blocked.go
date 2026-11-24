@@ -224,14 +224,14 @@ func (s *Server) handleBlockedAnswer(w http.ResponseWriter, r *http.Request) {
 			s.promptError(w, err)
 			return
 		}
-		s.enqueuePrompt(b.session, b.approval)
+		s.enqueuePrompt(b.session, b.approval, "")
 		writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "reason": "sent once you stop typing there"})
 		return
 	}
 	err := s.deliverPrompt(b.session, b.approval)
 	var ref *promptRefusal
 	if errors.As(err, &ref) && (ref.Code == refQuestion || ref.Code == refCopyMode) {
-		s.enqueuePrompt(b.session, b.approval)
+		s.enqueuePrompt(b.session, b.approval, "")
 		writeJSON(w, http.StatusAccepted, map[string]any{"queued": true, "reason": ref.Msg})
 		return
 	}

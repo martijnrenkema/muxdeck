@@ -1693,8 +1693,9 @@ async function fetchMachineName() {
 let refreshing = null, refreshQueued = false, refreshWhenVisible = false;
 function refreshSessions() {
   // A hidden page renders nothing; it only refreshes to raise its own
-  // alerts, which a device with Web Push leaves to the daemon.
-  if (document.hidden && pushActive) { refreshWhenVisible = true; return Promise.resolve(); }
+  // alerts, which a device with Web Push leaves to the daemon. Sessions on
+  // a remote are not pushed from here, so with remotes it keeps refreshing.
+  if (document.hidden && pushActive && !remotes.length) { refreshWhenVisible = true; return Promise.resolve(); }
   if (refreshing) { refreshQueued = true; return refreshing; }
   refreshing = (async () => {
     try {
@@ -2575,7 +2576,7 @@ function restoreSection(ul) {
     meta.className = "detail";
     const where = document.createElement("span");
     where.className = "meta";
-    const what = x.resume ? (x.agent === "codex" ? "codex resume" : "claude --resume") : "shell";
+    const what = x.resume ? ({ codex: "codex resume", gemini: "gemini --resume" }[x.agent] || "claude --resume") : "shell";
     where.textContent = `${x.dir ? shortPath(x.dir) : "~"} · ${what}`;
     meta.appendChild(where);
     copy.append(name, meta);

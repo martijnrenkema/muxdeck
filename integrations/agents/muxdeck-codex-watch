@@ -7,6 +7,7 @@ for the Codex process under its panes, read the new lines of that log and
 post to /api/agent/status:
   task_started  -> working
   task_complete -> waiting (muxdeck then notifies)
+  turn_aborted  -> waiting (interrupted)
   Codex gone    -> idle, chips cleared
 When Codex's own hooks run (~/.codex/hooks.json -> muxdeck-agent.sh with
 MUXDECK_AGENT=codex), they write the state per tmux session plus the
@@ -244,6 +245,7 @@ class Log:
         self.buf = b""
         self.model = ""
         self.state = "idle"
+        self.aborted = False
         self.ctx = self.rl5 = self.rl7 = None
         self.reset5 = self.reset7 = None
 
@@ -272,9 +274,12 @@ class Log:
             elif ev.get("type") == "event_msg":
                 t = p.get("type")
                 if t == "task_started":
-                    self.state = "working"
+                    self.state, self.aborted = "working", False
                 elif t == "task_complete":
-                    self.state = "waiting"
+                    self.state, self.aborted = "waiting", False
+                elif t == "turn_aborted":
+                    # Esc: the turn ended without a task_complete.
+                    self.state, self.aborted = "waiting", True
                 elif t == "token_count":
                     info = p.get("info") or {}
                     win = info.get("model_context_window")
@@ -308,6 +313,8 @@ class Log:
                 c["color"] = "warn"
             chips.append(c)
         note = "Codex is done and waiting for you" if self.state == "waiting" else ""
+        if note and self.aborted:
+            note += " (interrupted)"
         return {"session": session, "agent": "codex", "state": self.state,
                 "model": self.model, "note": note, "chips": chips, "transcript": self.path}
 

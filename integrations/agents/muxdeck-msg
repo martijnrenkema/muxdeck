@@ -64,11 +64,10 @@ current directory, --name to <your-session>-<agent>. Max 100000 characters.
 EOF
 }
 
+# Any pane of the session counts: the daemon finds the agent's pane itself.
 is_agent() {
-  case "$(tmux display-message -p -t "=$1:" '#{pane_current_command}' 2>/dev/null)" in
-    claude|codex|gemini|node) return 0 ;;
-  esac
-  return 1
+  tmux list-panes -s -t "=$1" -F '#{pane_current_command}' 2>/dev/null |
+    grep -Eqx 'claude|codex|gemini|node'
 }
 
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac

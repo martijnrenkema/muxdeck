@@ -50,7 +50,17 @@ type restoreState struct {
 	Sessions   []savedSession `json:"sessions"`
 	Lost       []savedSession `json:"lost"`
 	LostAt     time.Time      `json:"lost_at,omitzero"`
+	// Closing is a server's only session, gone with it a moment ago: almost
+	// always closed by hand, but a machine shutting down looks the same when
+	// tmux stops just before the daemon does. It is kept for closingGrace;
+	// a daemon that next wakes up in another boot knows which it was.
+	Closing   []savedSession `json:"closing,omitempty"`
+	ClosingAt time.Time      `json:"closing_at,omitzero"`
 }
+
+// closingGrace is how long the daemon has to outlive a single closed
+// session for that to count as closed by hand.
+const closingGrace = 30 * time.Second
 
 type restoreStore struct {
 	mu     sync.Mutex
@@ -126,7 +136,9 @@ func bootID() string {
 // Without one, a single session missing is the last session ending, after
 // which tmux stops by itself (exit-empty); the server dying with more than
 // one session in it, or with exit-empty off, is a loss.
-func takenBy(old restoreState, alive map[string]bool, boot string) (lost []savedSession, rebooted bool) {
+//
+// closing is that single session: not lost, unless a reboot follows at once.
+func takenBy(old restoreState, alive map[string]bool, boot string) (lost, closing []savedSession, rebooted bool) {
 	for _, x := range old.Sessions {
 		if alive[x.Name] || !tmux.ValidName(x.Name) {
 			continue
@@ -135,9 +147,9 @@ func takenBy(old restoreState, alive map[string]bool, boot string) (lost []saved
 	}
 	rebooted = old.Boot != "" && boot != "" && old.Boot != boot
 	if !rebooted && !old.KeepsEmpty && len(lost) == 1 {
-		return nil, false
+		return nil, lost, false
 	}
-	return lost, rebooted
+	return lost, nil, rebooted
 }
 
 // forgetSession drops a session that was closed on purpose from the
@@ -150,6 +162,7 @@ func (s *Server) forgetSession(name string) {
 	n, l := len(rs.st.Sessions), len(rs.st.Lost)
 	rs.st.Sessions = dropSaved(rs.st.Sessions, name)
 	rs.st.Lost = dropSaved(rs.st.Lost, name)
+	rs.st.Closing = dropSaved(rs.st.Closing, name)
 	if len(rs.st.Sessions) != n || len(rs.st.Lost) != l {
 		rs.save()
 	}
@@ -241,10 +254,33 @@ func (s *Server) snapshotSessions() {
 	defer rs.mu.Unlock()
 	rs.load()
 	before, _ := json.Marshal(rs.st)
+	if len(rs.st.Closing) > 0 {
+		switch {
+		case rs.st.Boot != "" && boot != "" && rs.st.Boot != boot:
+			// The daemon did not outlive that session: the machine went down.
+			n := 0
+			for _, x := range rs.st.Closing {
+				if !alive[x.Name] {
+					rs.st.Lost = append(dropSaved(rs.st.Lost, x.Name), x)
+					n++
+				}
+			}
+			if n > 0 {
+				rs.st.LostAt = now
+				log.Printf("restore: machine restarted right after %d session(s) ended, they can be restored", n)
+			}
+			rs.st.Closing, rs.st.ClosingAt = nil, time.Time{}
+		case now.Sub(rs.st.ClosingAt) > closingGrace:
+			rs.st.Closing, rs.st.ClosingAt = nil, time.Time{}
+		}
+	}
 	if rs.st.Server != "" && rs.st.Server != id {
 		// Another tmux server (or none): what the old one had and this one
 		// lacks may have been taken with it.
-		lost, rebooted := takenBy(rs.st, alive, boot)
+		lost, closing, rebooted := takenBy(rs.st, alive, boot)
+		if len(closing) > 0 {
+			rs.st.Closing, rs.st.ClosingAt = closing, now
+		}
 		for _, x := range lost {
 			rs.st.Lost = append(dropSaved(rs.st.Lost, x.Name), x)
 		}
@@ -276,6 +312,7 @@ func (s *Server) snapshotSessions() {
 	}
 	for name := range alive {
 		rs.st.Lost = dropSaved(rs.st.Lost, name)
+		rs.st.Closing = dropSaved(rs.st.Closing, name)
 	}
 	if len(rs.st.Lost) == 0 {
 		rs.st.LostAt = time.Time{}

@@ -215,6 +215,15 @@ func (m *Manager) Subscribe(sub Subscription) error {
 	for _, s := range m.subs {
 		if s.Endpoint != sub.Endpoint {
 			kept = append(kept, s)
+			continue
+		}
+		// A browser signs up again on every page load: that is the same
+		// device, added when it first came.
+		if !s.Added.IsZero() {
+			sub.Added = s.Added
+		}
+		if s == sub {
+			return nil
 		}
 	}
 	m.subs = append(kept, sub)

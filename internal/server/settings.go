@@ -211,6 +211,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 
 // handleLogout forgets this device's login.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Not behind auth (a logged-out device may ask too), so it checks for
+	// itself that the request is this site's own.
+	if foreignWrite(r) {
+		http.Error(w, "cross-site request refused", http.StatusForbidden)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: tokenCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
 		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",

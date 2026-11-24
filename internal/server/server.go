@@ -56,6 +56,7 @@ type Server struct {
 	regOwned map[string]bool   // sessions whose status came from Claude's registry
 	regPanes map[string]string // session → pane its Claude runs in, per the registry
 	regLive  map[string]subagent.Live
+	regSeen  map[string]int // sessions the registry had a Claude for → scans it has been missing
 	restore  restoreStore
 	blocks   blockStore
 	convMu   sync.Mutex

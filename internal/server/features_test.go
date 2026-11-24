@@ -4,10 +4,15 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/josecarlosrivas/muxdeck/internal/agent"
+	"github.com/josecarlosrivas/muxdeck/internal/subagent"
 )
 
 func TestCheckAnswers(t *testing.T) {
@@ -58,25 +63,87 @@ func TestTakenBy(t *testing.T) {
 		}
 		return strings.Join(n, ",")
 	}
-	if lost, rebooted := takenBy(one, none, "b1"); len(lost) != 0 || rebooted {
+	if lost, _, rebooted := takenBy(one, none, "b1"); len(lost) != 0 || rebooted {
 		t.Errorf("last session ending (exit-empty) counted as loss: %v", names(lost))
 	}
-	if lost, _ := takenBy(two, none, "b1"); names(lost) != "a,b" {
+	if lost, _, _ := takenBy(two, none, "b1"); names(lost) != "a,b" {
 		t.Errorf("server dying with two sessions: %q", names(lost))
 	}
-	if lost, _ := takenBy(two, map[string]bool{"b": true}, "b1"); len(lost) != 0 {
+	if lost, _, _ := takenBy(two, map[string]bool{"b": true}, "b1"); len(lost) != 0 {
 		t.Errorf("one gone, the other on the new server: %q", names(lost))
 	}
-	if lost, rebooted := takenBy(one, none, "b2"); names(lost) != "a" || !rebooted {
+	if lost, _, rebooted := takenBy(one, none, "b2"); names(lost) != "a" || !rebooted {
 		t.Errorf("reboot with one session: %q rebooted=%v", names(lost), rebooted)
 	}
 	keeps := one
 	keeps.KeepsEmpty = true
-	if lost, _ := takenBy(keeps, none, "b1"); names(lost) != "a" {
+	if lost, _, _ := takenBy(keeps, none, "b1"); names(lost) != "a" {
 		t.Errorf("exit-empty off, server gone: %q", names(lost))
 	}
-	if lost, _ := takenBy(one, none, ""); len(lost) != 0 {
+	if lost, _, _ := takenBy(one, none, ""); len(lost) != 0 {
 		t.Errorf("no boot id, one session: %q", names(lost))
+	}
+	if _, closing, _ := takenBy(one, none, "b1"); names(closing) != "a" {
+		t.Errorf("a single session gone is kept as closing: %q", names(closing))
+	}
+	if _, closing, _ := takenBy(two, none, "b1"); len(closing) != 0 {
+		t.Errorf("two sessions gone are lost, not closing: %q", names(closing))
+	}
+}
+
+func TestClaudeGone(t *testing.T) {
+	s := newTestServer(t)
+	s.agents.Set("gone", agent.Status{Agent: "claude-code", State: agent.StateWorking, Model: "M"})
+	s.agents.Set("hooks", agent.Status{Agent: "claude-code", State: agent.StateWorking})
+	s.agents.Set("other", agent.Status{Agent: "codex", State: agent.StateWorking})
+	panes := map[string][]int{"gone": {10}, "hooks": {11}, "other": {12}}
+	both := []subagent.Live{{Session: "gone"}, {Session: "other"}}
+	s.claudeGone(panes, both)
+	// tmux not answering judges nothing, however long it lasts.
+	for i := 0; i < regGoneScans+1; i++ {
+		s.claudeGone(nil, nil)
+	}
+	for i := 0; i < regGoneScans-1; i++ {
+		s.claudeGone(panes, nil)
+	}
+	if st, _ := s.agents.Get("gone"); st.State != agent.StateWorking {
+		t.Fatalf("judged after %d scans: %s", regGoneScans-1, st.State)
+	}
+	s.claudeGone(panes, nil)
+	if st, _ := s.agents.Get("gone"); st.State != agent.StateIdle || st.Model != "M" {
+		t.Errorf("Claude gone from the registry: state %q model %q, want idle M", st.State, st.Model)
+	}
+	if st, _ := s.agents.Get("hooks"); st.State != agent.StateWorking {
+		t.Errorf("a Claude the registry never listed was judged: %s", st.State)
+	}
+	if st, _ := s.agents.Get("other"); st.State != agent.StateWorking {
+		t.Errorf("another agent's status was touched: %s", st.State)
+	}
+	// Seen again in time: the count starts over.
+	s.agents.Set("back", agent.Status{Agent: "claude-code", State: agent.StateWaiting})
+	panes["back"] = []int{13}
+	back := []subagent.Live{{Session: "back"}}
+	s.claudeGone(panes, back)
+	s.claudeGone(panes, nil)
+	s.claudeGone(panes, nil)
+	s.claudeGone(panes, back)
+	s.claudeGone(panes, nil)
+	s.claudeGone(panes, nil)
+	if st, _ := s.agents.Get("back"); st.State != agent.StateWaiting {
+		t.Errorf("a Claude that came back was judged gone: %s", st.State)
+	}
+}
+
+func TestLogoutRefusesOtherSites(t *testing.T) {
+	s := newTestServer(t)
+	for site, want := range map[string]int{"same-origin": http.StatusNoContent, "same-site": http.StatusForbidden, "cross-site": http.StatusForbidden} {
+		req := httptest.NewRequest(http.MethodPost, "/api/logout", nil)
+		req.Header.Set("Sec-Fetch-Site", site)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("logout from %s: %d, want %d", site, rec.Code, want)
+		}
 	}
 }
 
